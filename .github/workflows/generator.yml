@@ -1962,7 +1962,10 @@ jobs:
               const missingTitle    = !record.title    || String(record.title).trim()    === '';
               const missingTags     = !record.tags     || String(record.tags).trim()     === '';
               const missingCategory = !record.category || String(record.category).trim() === '';
-              const needsMetadata   = missingTitle || missingTags || missingCategory;
+              // v27.11 FIX: self-heal records that were patched with junk fallback metadata by
+              // older runs (title like "Image -P3puKjC", no real tags, category OTHER).
+              const junkTitle = /^image\s+[-_A-Za-z0-9]{6,}$/i.test(String(record.title || '').trim());
+              const needsMetadata   = missingTitle || missingTags || missingCategory || junkTitle;
 
               if (!needsMetadata) {
                 skippedHasMetadata++;
@@ -1986,6 +1989,7 @@ jobs:
                 missingTitle    ? 'title'    : null,
                 missingTags     ? 'tags'     : null,
                 missingCategory ? 'category' : null,
+                junkTitle       ? 'junk title (re-generating)' : null,
               ].filter(Boolean).join(', ');
               console.log(`  ✅ [${key}] Queued — ${kindLabel(kind)} | source: ${sourceType} | missing: ${missing}`);
               candidates.push({ key, record, kind });
@@ -2228,20 +2232,44 @@ jobs:
           }
 
           // ─── GEMINI: CHECK WHETHER AN IMAGE ATTACHMENT IS VISIBLE ─────────────────
+          // v27.11 FIX: the old check used loose selectors like [class*="attachment"], which
+          // match unrelated Gemini chrome on every page -> upload was reported "successful"
+          // even when nothing was attached, Gemini answered the text-only prompt with a
+          // refusal, and junk fallback metadata got written to Firebase.
+          // Now an element only counts when it is a real, VISIBLE preview/chip in the composer.
           async function hasImageAttached(geminiPage) {
-            return geminiPage.evaluate(() => [
-              'ms-file-attachment',
-              'upload-progress-thumbnail',
-              '[class*="upload-thumbnail"]',
-              '[class*="file-chip"]',
-              '[class*="attachment"]',
-              '[class*="FileChip"]',
-              'rich-textarea img',
-              '[data-test-id*="attachment"]',
-              '[data-test-id*="upload"]',
-              '.attachment-chip',
-              '.upload-thumbnail',
-            ].some(s => document.querySelector(s))).catch(() => false);
+            return geminiPage.evaluate(() => {
+              const sels = [
+                'ms-file-attachment',
+                'upload-progress-thumbnail',
+                '[class*="upload-thumbnail"]',
+                '[class*="file-chip"]',
+                '.attachment-chip',
+                '.upload-thumbnail',
+                '[data-test-id*="attachment"] img',
+                'rich-textarea img',
+                'img[src^="blob:"]',
+                'img[src^="data:image"]',
+              ];
+              for (const s of sels) {
+                for (const el of document.querySelectorAll(s)) {
+                  const r = el.getBoundingClientRect();
+                  const st = getComputedStyle(el);
+                  if (r.width > 20 && r.height > 20 && st.visibility !== 'hidden' && st.display !== 'none') return true;
+                }
+              }
+              return false;
+            }).catch(() => false);
+          }
+
+          // Waits until the attachment preview really shows up (upload finished).
+          async function waitForImageAttached(geminiPage, ms = 15000) {
+            const until = Date.now() + ms;
+            while (Date.now() < until) {
+              if (await hasImageAttached(geminiPage)) return true;
+              await sleep(1000);
+            }
+            return false;
           }
 
           // ─── GEMINI: UPLOAD IMAGE FILE ─────────────────────────────────────────────
@@ -2357,15 +2385,23 @@ jobs:
 
               function delay(ms) { return new Promise(r => setTimeout(r, ms)); }
 
+              // v27.11 FIX: strict, visibility-aware check (see hasImageAttached above).
               function hasAttachment() {
-                return [
+                const sels = [
                   'ms-file-attachment', 'upload-progress-thumbnail',
                   '[class*="upload-thumbnail"]', '[class*="file-chip"]',
-                  '[class*="attachment"]', '[class*="FileChip"]',
-                  '[jsname][class*="chip"]', 'rich-textarea img',
-                  '[data-test-id*="attachment"]', '[data-test-id*="upload"]',
                   '.attachment-chip', '.upload-thumbnail',
-                ].some(s => document.querySelector(s));
+                  '[data-test-id*="attachment"] img', 'rich-textarea img',
+                  'img[src^="blob:"]', 'img[src^="data:image"]',
+                ];
+                for (const s of sels) {
+                  for (const el of document.querySelectorAll(s)) {
+                    const r = el.getBoundingClientRect();
+                    const st = getComputedStyle(el);
+                    if (r.width > 20 && r.height > 20 && st.visibility !== 'hidden' && st.display !== 'none') return true;
+                  }
+                }
+                return false;
               }
 
               const files = [dataUrlToFile(dataUrl, name, mime)];
@@ -2502,6 +2538,13 @@ jobs:
             if (!uploaded) {
               throw new Error('Could not attach image to Gemini after all strategies.');
             }
+            // v27.11 FIX: never send the prompt until the attachment preview is really visible.
+            // Without this, a false-positive upload produced a text-only question -> Gemini
+            // refused -> junk metadata was saved as a "success".
+            if (!(await waitForImageAttached(geminiPage, 15000))) {
+              throw new Error('Image attachment not confirmed in Gemini composer (upload reported success but no preview appeared).');
+            }
+            console.log('    🖼️  Attachment confirmed in composer');
             await sleep(1500);
 
             // Build the metadata prompt (content-kind aware: wallpaper / set / video)
@@ -2542,8 +2585,26 @@ jobs:
               return /^(\.{3}|\u2026)$/.test(rest) ? '' : rest;   // the literal "..." template placeholder counts as missing
             };
 
-            const title       = cleanTitle(getTagValue(responseText, 'TITLE'))       || `Image ${key.slice(0, 8)}`;
-            const tags        = cleanKeywords(getTagValue(responseText, 'KEYWORDS'));
+            // v27.11 FIX: validate the reply BEFORE building metadata. Previously a refusal or
+            // error message from Gemini parsed into zero tags + fallback title `Image <key>` +
+            // category OTHER + no policy verdict, and was still patched to Firebase as success.
+            const rawTitle    = cleanTitle(getTagValue(responseText, 'TITLE'));
+            const rawTags     = cleanKeywords(getTagValue(responseText, 'KEYWORDS'));
+            const policy      = getTagValue(responseText, 'POLICY');
+            const missingTags = [
+              !rawTitle ? 'TITLE' : null,
+              !rawTags  ? 'KEYWORDS' : null,
+              !policy   ? 'POLICY' : null,
+            ].filter(Boolean);
+            if (missingTags.length) {
+              throw new Error(
+                `Gemini returned an unusable reply — missing ${missingTags.join(', ')} ` +
+                `(${responseText.length} chars): "${responseText.slice(0, 160).replace(/\s+/g, ' ')}"`
+              );
+            }
+
+            const title       = rawTitle;
+            const tags        = rawTags;
             const category    = cleanCategory(getTagValue(responseText, 'CATEGORY'));
             const description = cleanDescription(getTagValue(responseText, 'DESCRIPTION'));
 
@@ -2551,9 +2612,7 @@ jobs:
             console.log(`  🏷️  Tags     : ${tags}`);
             console.log(`  📁 Category : ${category}`);
             console.log(`  📝 Desc     : ${description}`);
-
-            const policy = getTagValue(responseText, 'POLICY');
-            console.log(`  🛡️  Policy   : ${policy || '(no verdict)'}`);
+            console.log(`  🛡️  Policy   : ${policy}`);
             return { title, tags, category, description, policy };
           }
 
@@ -2686,7 +2745,17 @@ jobs:
               let tmpImagePath = null;
               try {
                 tmpImagePath = await imageToTempFile(record, key, kind);
-                let metadata = await generateImageMetadata(tmpImagePath, key, geminiPage, kind);
+                // v27.11 FIX: retry once on an unusable reply / failed attachment / timeout.
+                // A fresh chat often fixes a stuck upload; junk is never written any more.
+                let metadata;
+                try {
+                  metadata = await generateImageMetadata(tmpImagePath, key, geminiPage, kind);
+                } catch (e) {
+                  if (!/unusable reply|attachment|attach image|timeout/i.test(e.message)) throw e;
+                  console.warn(`  🔁 [${db.name}] [${key}] ${e.message} — retrying once with a fresh chat`);
+                  await sleep(5000);
+                  metadata = await generateImageMetadata(tmpImagePath, key, geminiPage, kind);
+                }
                 let check = zedgeEnforce(metadata, 'image');
                 if (check.issues.length) {
                   console.warn(`  🚫 [${db.name}] [${key}] Zedge policy: ${check.issues.join('; ')} — regenerating metadata once`);
@@ -2728,6 +2797,21 @@ jobs:
 
               } catch (err) {
                 console.error(`  ❌ [${db.name}] [${key}] Failed: ${err.message}`);
+                // v27.11 FIX: a 404 means the asset is missing in R2 (record written, upload lost).
+                // Retrying every run is pointless, so flag the record once so the panel/app shows
+                // it in Failed with a clear reason. Transient Gemini errors are only logged.
+                if (/HTTP 404|No fileBase64, fileUrl/i.test(err.message)) {
+                  try {
+                    await firebasePatchMetadata(db.url, IMAGE_QUEUE_PATH, key, {
+                      status: 'failed',
+                      error: `Source file missing in R2 — ${err.message}. Re-upload the file from the panel, then Requeue.`,
+                      failedAt: Date.now()
+                    });
+                    console.warn(`  🏷️  [${db.name}] [${key}] Marked failed: missing source file in R2`);
+                  } catch (pe) {
+                    console.warn(`  ⚠️  Could not mark record failed: ${pe.message}`);
+                  }
+                }
                 totalFailed++;
               } finally {
                 if (tmpImagePath && fs.existsSync(tmpImagePath)) {
