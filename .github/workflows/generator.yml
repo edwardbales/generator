@@ -326,13 +326,16 @@ jobs:
             console.log(`    ⌨️  Submitted via Enter key`);
 
             // Poll: wait for the new response element to appear, then stabilize
-            const deadline = Date.now() + 90000;
+            // v27.11 FIX: 90s was too short — Gemini often streams a long tagged reply (and can
+            // queue the request for a while). Raised to 240s, with a 15s no-stream-at-all guard.
+            const GEMINI_REPLY_TIMEOUT_MS = 240000;
+            const deadline = Date.now() + GEMINI_REPLY_TIMEOUT_MS;
             // v27.10: a reply is only accepted once it contains the closing tag of the LAST template section
             // (opts.completeWhen). Before, a 3 s pause while Gemini was still streaming was mistaken for a
             // finished answer -> half a template got parsed -> the audio prompt silently fell back to
             // "electronic synth pulse" while title/tags described another sound (ringtone != metadata).
             const completeRe = opts.completeWhen || null;
-            const softDeadline = Date.now() + 75000;   // after this a stable partial reply is accepted (the parser validates it)
+            const softDeadline = Date.now() + (GEMINI_REPLY_TIMEOUT_MS - 30000);   // after this a stable partial reply is accepted (the parser validates it)
             let responseText = '';
             let lastSeen = '';
             let stableCount = 0;
@@ -383,7 +386,7 @@ jobs:
             }
 
             if (!responseText) {
-              throw new Error(`Gemini web timeout: no response within 90s`);
+              throw new Error(`Gemini web timeout: no response within ${Math.round(GEMINI_REPLY_TIMEOUT_MS / 1000)}s`);
             }
             console.log(`    ✅ Got response (${responseText.length} chars)`);
             return responseText;
@@ -2181,13 +2184,16 @@ jobs:
             await geminiPage.keyboard.press('Enter');
             console.log(`    ⌨️  Submitted via Enter key`);
 
-            const deadline = Date.now() + 90000;
+            // v27.11 FIX: 90s was too short — Gemini often streams a long tagged reply (and can
+            // queue the request for a while). Raised to 240s, with a 15s no-stream-at-all guard.
+            const GEMINI_REPLY_TIMEOUT_MS = 240000;
+            const deadline = Date.now() + GEMINI_REPLY_TIMEOUT_MS;
             // v27.10: a reply is only accepted once it contains the closing tag of the LAST template section
             // (opts.completeWhen). Before, a 3 s pause while Gemini was still streaming was mistaken for a
             // finished answer -> half a template got parsed -> the audio prompt silently fell back to
             // "electronic synth pulse" while title/tags described another sound (ringtone != metadata).
             const completeRe = opts.completeWhen || null;
-            const softDeadline = Date.now() + 75000;   // after this a stable partial reply is accepted (the parser validates it)
+            const softDeadline = Date.now() + (GEMINI_REPLY_TIMEOUT_MS - 30000);   // after this a stable partial reply is accepted (the parser validates it)
             let responseText = '';
             let lastSeen = '';
             let stableCount = 0;
@@ -2226,7 +2232,7 @@ jobs:
               }
             }
 
-            if (!responseText) throw new Error('Gemini web timeout: no response within 90s');
+            if (!responseText) throw new Error(`Gemini web timeout: no response within ${Math.round(GEMINI_REPLY_TIMEOUT_MS / 1000)}s`);
             console.log(`    ✅ Got response (${responseText.length} chars)`);
             return responseText;
           }
