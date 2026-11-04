@@ -1110,11 +1110,27 @@ jobs:
                 await page.mouse.move(300 + Math.random() * 200, 250 + Math.random() * 150, { steps: 10 });
                 await sleep(500);
 
-                // ── Step 2: Click Sign Up button using real hardware mouse click ─────
+                // ── Step 2: Click Sign Up button (target VISIBLE button, fallback to DOM click) ─────
                 console.log('  🖱️  Step 2: Clicking Sign Up button...');
-                const signupLoc = page.locator('button:has-text("Sign up"), button:has-text("Sign Up"), a:has-text("Sign up"), a:has-text("Sign Up"), [data-testid="signup"]').first();
-                await humanClick(page, signupLoc);
-                console.log('  ✅ Sign Up clicked');
+                const visibleSignupLoc = page.locator(
+                  'button:has-text("Sign up"):visible, button:has-text("Sign Up"):visible, a:has-text("Sign up"):visible, a:has-text("Sign Up"):visible, [data-testid="signup"]:visible'
+                ).first();
+
+                const isVis = await visibleSignupLoc.waitFor({ state: 'visible', timeout: 8000 }).then(() => true).catch(() => false);
+                if (isVis) {
+                  await humanClick(page, visibleSignupLoc);
+                  console.log('  ✅ Sign Up clicked (visible button)');
+                } else {
+                  console.log('  ⚠️ Visible Sign Up button not directly matched — triggering DOM click...');
+                  await page.evaluate(() => {
+                    const els = [...document.querySelectorAll('button, a')].filter(el =>
+                      /^\s*sign\s*up\s*$/i.test(el.innerText || el.textContent || '')
+                    );
+                    const vis = els.find(el => el.offsetParent !== null) || els[0];
+                    if (vis) vis.click();
+                  });
+                  console.log('  ✅ Sign Up triggered via DOM click');
+                }
 
                 await sleep(3000);
                 await page.waitForLoadState('networkidle', { timeout: 12000 }).catch(() => {});
